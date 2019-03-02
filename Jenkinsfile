@@ -4,13 +4,14 @@ pipeline {
         // 15m quiet period as described at https://jenkins.io/blog/2010/08/11/quiet-period-feature/
         // quietPeriod(900)
         disableConcurrentBuilds()
-        timeout(time: 5, unit: "HOURS")
+        timeout(time: 4, unit: "HOURS")
         timestamps()
     }
     parameters {
         string(name: "BRANCH", defaultValue: "master")
-        choice(name: "CHANNEL", choices: ["dev", "beta", "release"])
-        booleanParam(name: "CLEAN_WORKSPACE", defaultValue: false)
+        choice(name: "CHANNEL", choices: ["nightly", "dev", "beta", "release"])
+        booleanParam(name: "DISABLE_SCCACHE", defaultValue: false)
+        booleanParam(name: "WIPE_WORKSPACE", defaultValue: false)
         booleanParam(name: "RUN_INIT", defaultValue: false)
     }
     environment {
@@ -44,6 +45,14 @@ pipeline {
                         SCCACHE_BUCKET = credentials("brave-browser-sccache-linux-s3-bucket")
                     }
                     stages {
+                        stage("wipe") {
+                            when {
+                                expression { params.WIPE_WORKSPACE }
+                            }
+                            steps {
+                                sh "rm -rf ${WORKSPACE}/*"
+                            }
+                        }
                         stage("unlock") {
                             steps {
                                 sh "rm -rf ${GIT_CACHE_PATH}/*.lock"
@@ -55,14 +64,6 @@ pipeline {
                             }
                             steps {
                                 git branch: "${BRANCH_TO_BUILD}", url: "https://github.com/brave/brave-browser.git"
-                            }
-                        }
-                        stage("clean") {
-                            when {
-                                expression { params.CLEAN_WORKSPACE }
-                            }
-                            steps {
-                                sh "git clean -ffxd"
                             }
                         }
                         stage("install") {
@@ -105,54 +106,73 @@ pipeline {
                                 }
                             }
                         }
-                        stage("build") {
+                        stage("config") {
                             steps {
                                 sh """
                                     npm config --userconfig=.npmrc set brave_referrals_api_key ${REFERRAL_API_KEY}
                                     npm config --userconfig=.npmrc set brave_google_api_endpoint https://location.services.mozilla.com/v1/geolocate?key=
                                     npm config --userconfig=.npmrc set brave_google_api_key ${BRAVE_GOOGLE_API_KEY}
-                                    npm config --userconfig=.npmrc set google_api_endpoint "safebrowsing.brave.com"
-                                    npm config --userconfig=.npmrc set google_api_key "dummytoken"
-                                    # npm config --userconfig=.npmrc set sccache "sccache"
-
-                                    npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true
+                                    npm config --userconfig=.npmrc set google_api_endpoint safebrowsing.brave.com
+                                    npm config --userconfig=.npmrc set google_api_key dummytoken
                                 """
+                            }
+                        }
+                        stage("sccache") {
+                            when {
+                                anyOf {
+                                        expression { "${RELEASE_TYPE}" == "ci" }
+                                        expression { "${DISABLE_SCCACHE}" == "false" }
+                                }
+                            }
+                            steps {
+                                sh "npm config --userconfig=.npmrc set sccache sccache"
+                            }
+                        }
+                        stage("build") {
+                            steps {
+                                sh "npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true"
                             }
                         }
                         stage("test-security") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test-security -- --output_path=\"${OUT_DIR}/brave\""
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 4, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test-security -- --output_path=\"${OUT_DIR}/brave\""
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-unit") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-browser") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
@@ -162,7 +182,6 @@ pipeline {
                                 sh "npm run create_dist -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true"
                             }
                         }
-                        // TODO: add upload step here
                         stage("github-upload") {
                             when {
                                 expression { "${RELEASE_TYPE}" == "release" }
@@ -180,7 +199,7 @@ pipeline {
                         }
                         stage("archive") {
                             steps {
-                                // commented because it takes much longer to copy to Jenkins thant to S3
+                                // commented because it takes much longer to copy to Jenkins than to S3
                                 // archiveArtifacts artifacts: "${OUT_DIR}/*.deb,${OUT_DIR}/*.rpm", fingerprint: true
                                 s3Upload(acl: "Private", bucket: "${BRAVE_ARTIFACTS_BUCKET}", includePathPattern: "*.deb",
                                     path: "${JOB_NAME}/${BUILD_NUMBER}/", pathStyleAccessEnabled: true, payloadSigningEnabled: true, workingDir: "${OUT_DIR}"
@@ -197,9 +216,16 @@ pipeline {
                     environment {
                         GIT_CACHE_PATH = "${HOME}/cache"
                         SCCACHE_BUCKET = credentials("brave-browser-sccache-mac-s3-bucket")
-                        PATH = "${HOME}/.cargo/bin:${PATH}:/usr/local/bin/"
                     }
                     stages {
+                        stage("wipe") {
+                            when {
+                                expression { params.WIPE_WORKSPACE }
+                            }
+                            steps {
+                                sh "rm -rf ${WORKSPACE}/*"
+                            }
+                        }
                         stage("unlock") {
                             steps {
                                 sh "rm -rf ${GIT_CACHE_PATH}/*.lock"
@@ -211,14 +237,6 @@ pipeline {
                             }
                             steps {
                                 git branch: "${BRANCH_TO_BUILD}", url: "https://github.com/brave/brave-browser.git"
-                            }
-                        }
-                        stage("clean") {
-                            when {
-                                expression { params.CLEAN_WORKSPACE }
-                            }
-                            steps {
-                                sh "git clean -ffxd"
                             }
                         }
                         stage("install") {
@@ -261,63 +279,73 @@ pipeline {
                                 }
                             }
                         }
-                        stage("npm-config-sccache") {
-                            when {
-                                expression { "${RELEASE_TYPE}" == "ci" }
-                            }
-                            steps {
-                                sh """
-                                    npm config --userconfig=.npmrc set sccache "sccache"
-                                """
-                            }
-                        }
-                        stage("build") {
+                        stage("config") {
                             steps {
                                 sh """
                                     npm config --userconfig=.npmrc set brave_referrals_api_key ${REFERRAL_API_KEY}
                                     npm config --userconfig=.npmrc set brave_google_api_endpoint https://location.services.mozilla.com/v1/geolocate?key=
                                     npm config --userconfig=.npmrc set brave_google_api_key ${BRAVE_GOOGLE_API_KEY}
-                                    npm config --userconfig=.npmrc set google_api_endpoint "safebrowsing.brave.com"
-                                    npm config --userconfig=.npmrc set google_api_key "dummytoken"
-
-                                    npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true
+                                    npm config --userconfig=.npmrc set google_api_endpoint safebrowsing.brave.com
+                                    npm config --userconfig=.npmrc set google_api_key dummytoken
                                 """
+                            }
+                        }
+                        stage("sccache") {
+                            when {
+                                anyOf {
+                                        expression { "${RELEASE_TYPE}" == "ci" }
+                                        expression { "${DISABLE_SCCACHE}" == "false" }
+                                }
+                            }
+                            steps {
+                                sh "npm config --userconfig=.npmrc set sccache sccache"
+                            }
+                        }
+                        stage("build") {
+                            steps {
+                                sh "npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true"
                             }
                         }
                         stage("test-security") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test-security -- --output_path=\"${OUT_DIR}/Brave\\ Browser\\ ${CHANNEL_CAPITALIZED}.app/Contents/MacOS/Brave\\ Browser\\ ${CHANNEL_CAPITALIZED}\""
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 4, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test-security -- --output_path=\"${OUT_DIR}/Brave\\ Browser\\ ${CHANNEL_CAPITALIZED}.app/Contents/MacOS/Brave\\ Browser\\ ${CHANNEL_CAPITALIZED}\""
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-unit") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-browser") {
                             steps {
-                                script {
-                                    try {
-                                        sh "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            sh "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
@@ -388,6 +416,14 @@ pipeline {
                         AUTHENTICODE_PASSWORD_UNESCAPED = credentials("digicert-brave-browser-development-certificate")
                     }
                     stages {
+                        stage("wipe") {
+                            when {
+                                expression { params.WIPE_WORKSPACE }
+                            }
+                            steps {
+                                powershell "Remove-Item ${WORKSPACE}/*"
+                            }
+                        }
                         stage("unlock") {
                             steps {
                                 powershell "Remove-Item ${GIT_CACHE_PATH}/*.lock"
@@ -399,14 +435,6 @@ pipeline {
                             }
                             steps {
                                 git branch: "${BRANCH_TO_BUILD}", url: "https://github.com/brave/brave-browser.git"
-                            }
-                        }
-                        stage("clean") {
-                            when {
-                                expression { params.CLEAN_WORKSPACE }
-                            }
-                            steps {
-                                powershell "git clean -fxd"
                             }
                         }
                         stage("install") {
@@ -449,55 +477,74 @@ pipeline {
                                 }
                             }
                         }
-                        stage("build") {
+                        stage("config") {
                             steps {
                                 powershell """
                                     npm config --userconfig=.npmrc set brave_referrals_api_key ${REFERRAL_API_KEY}
                                     npm config --userconfig=.npmrc set brave_google_api_endpoint https://location.services.mozilla.com/v1/geolocate?key=
                                     npm config --userconfig=.npmrc set brave_google_api_key ${BRAVE_GOOGLE_API_KEY}
-                                    npm config --userconfig=.npmrc set google_api_endpoint "safebrowsing.brave.com"
-                                    npm config --userconfig=.npmrc set google_api_key "dummytoken"
-                                    # npm config --userconfig=.npmrc set sccache "sccache"
-
-                                    npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true
+                                    npm config --userconfig=.npmrc set google_api_endpoint safebrowsing.brave.com
+                                    npm config --userconfig=.npmrc set google_api_key dummytoken
                                 """
+                            }
+                        }
+                        stage("sccache") {
+                            when {
+                                anyOf {
+                                        expression { "${RELEASE_TYPE}" == "ci" }
+                                        expression { "${DISABLE_SCCACHE}" == "false" }
+                                }
+                            }
+                            steps {
+                                powershell "npm config --userconfig=.npmrc set sccache sccache"
+                            }
+                        }
+                        stage("build") {
+                            steps {
+                                powershell "npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true"
                             }
                         }
                         stage("test-security") {
                             steps {
-                                script {
-                                    try {
-                                        powershell "npm run test-security -- --output_path=\"${OUT_DIR}/brave.exe\""
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 4, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            powershell "npm run test-security -- --output_path=\"${OUT_DIR}/brave.exe\""
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-unit") {
                             steps {
-                                script {
-                                    try {
-                                        powershell "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            powershell "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
-                        // TODO: fix running browser tests in non-interactive mode
+                        // // TODO: fix running browser tests in non-interactive mode
                         // stage("test-browser") {
                         //     steps {
-                        //         script {
-                        //             try {
-                        //                 powershell "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
-                        //                 xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                        //             }
-                        //             catch (ex) {
-                        //                 currentBuild.result = "UNSTABLE"
+                        //         timeout(time: 20, unit: "MINUTES") {
+                        //             script {
+                        //                 try {
+                        //                     powershell "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
+                        //                     xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                        //                 }
+                        //                 catch (ex) {
+                        //                     currentBuild.result = "UNSTABLE"
+                        //                 }
                         //             }
                         //         }
                         //     }
@@ -545,7 +592,7 @@ pipeline {
                         }
                         stage("archive") {
                             steps {
-                                // commented because it takes much longer to copy to Jenkins thant to S3
+                                // commented because it takes much longer to copy to Jenkins than to S3
                                 // archiveArtifacts artifacts: "${OUT_DIR}/BraveBrowser*.exe", fingerprint: true
                                 s3Upload(acl: "Private", bucket: "${BRAVE_ARTIFACTS_BUCKET}", includePathPattern: "brave_installer_*.exe",
                                     path: "${JOB_NAME}/${BUILD_NUMBER}/", pathStyleAccessEnabled: true, payloadSigningEnabled: true, workingDir: "${OUT_DIR}"
@@ -590,6 +637,14 @@ pipeline {
                         AUTHENTICODE_PASSWORD_UNESCAPED = credentials("digicert-brave-browser-development-certificate")
                     }
                     stages {
+                        stage("wipe") {
+                            when {
+                                expression { params.WIPE_WORKSPACE }
+                            }
+                            steps {
+                                powershell "Remove-Item ${WORKSPACE}/*"
+                            }
+                        }
                         stage("unlock") {
                             steps {
                                 powershell "Remove-Item ${GIT_CACHE_PATH}/*.lock"
@@ -601,14 +656,6 @@ pipeline {
                             }
                             steps {
                                 git branch: "${BRANCH_TO_BUILD}", url: "https://github.com/brave/brave-browser.git"
-                            }
-                        }
-                        stage("clean") {
-                            when {
-                                expression { params.CLEAN_WORKSPACE }
-                            }
-                            steps {
-                                powershell "git clean -fxd"
                             }
                         }
                         stage("install") {
@@ -651,55 +698,74 @@ pipeline {
                                 }
                             }
                         }
-                        stage("build") {
+                        stage("config") {
                             steps {
                                 powershell """
                                     npm config --userconfig=.npmrc set brave_referrals_api_key ${REFERRAL_API_KEY}
                                     npm config --userconfig=.npmrc set brave_google_api_endpoint https://location.services.mozilla.com/v1/geolocate?key=
                                     npm config --userconfig=.npmrc set brave_google_api_key ${BRAVE_GOOGLE_API_KEY}
-                                    npm config --userconfig=.npmrc set google_api_endpoint "safebrowsing.brave.com"
-                                    npm config --userconfig=.npmrc set google_api_key "dummytoken"
-                                    # npm config --userconfig=.npmrc set sccache "sccache"
-
-                                    npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true --target_arch=ia32
+                                    npm config --userconfig=.npmrc set google_api_endpoint safebrowsing.brave.com
+                                    npm config --userconfig=.npmrc set google_api_key dummytoken
                                 """
+                            }
+                        }
+                        stage("sccache") {
+                            when {
+                                anyOf {
+                                        expression { "${RELEASE_TYPE}" == "ci" }
+                                        expression { "${DISABLE_SCCACHE}" == "false" }
+                                }
+                            }
+                            steps {
+                                powershell "npm config --userconfig=.npmrc set sccache sccache"
+                            }
+                        }
+                        stage("build") {
+                            steps {
+                                powershell "npm run build -- ${BUILD_TYPE} --channel=${CHANNEL} --official_build=true --target_arch=ia32"
                             }
                         }
                         stage("test-security") {
                             steps {
-                                script {
-                                    try {
-                                        powershell "npm run test-security -- --output_path=\"${OUT_DIR}/brave.exe\""
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 4, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            powershell "npm run test-security -- --output_path=\"${OUT_DIR}/brave.exe\""
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                         stage("test-unit") {
                             steps {
-                                script {
-                                    try {
-                                        powershell "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
-                                        xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                                    }
-                                    catch (ex) {
-                                        currentBuild.result = "UNSTABLE"
+                                timeout(time: 20, unit: "MINUTES") {
+                                    script {
+                                        try {
+                                            powershell "npm run test -- brave_unit_tests ${BUILD_TYPE} --output brave_unit_tests.xml"
+                                            xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_unit_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                                        }
+                                        catch (ex) {
+                                            currentBuild.result = "UNSTABLE"
+                                        }
                                     }
                                 }
                             }
                         }
-                        // TODO: fix running browser tests in non-interactive mode
+                        // // TODO: fix running browser tests in non-interactive mode
                         // stage("test-browser") {
                         //     steps {
-                        //         script {
-                        //             try {
-                        //                 powershell "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
-                        //                 xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
-                        //             }
-                        //             catch (ex) {
-                        //                 currentBuild.result = "UNSTABLE"
+                        //         timeout(time: 20, unit: "MINUTES") {
+                        //             script {
+                        //                 try {
+                        //                     powershell "npm run test -- brave_browser_tests ${BUILD_TYPE} --output brave_browser_tests.xml"
+                        //                     xunit([GoogleTest(deleteOutputFiles: true, failIfNotNew: true, pattern: "src/brave_browser_tests.xml", skipNoTestFiles: false, stopProcessingIfError: true)])
+                        //                 }
+                        //                 catch (ex) {
+                        //                     currentBuild.result = "UNSTABLE"
+                        //                 }
                         //             }
                         //         }
                         //     }
@@ -734,7 +800,7 @@ pipeline {
                         }
                         stage("archive") {
                             steps {
-                                // commented because it takes much longer to copy to Jenkins thant to S3
+                                // commented because it takes much longer to copy to Jenkins than to S3
                                 // archiveArtifacts artifacts: "${OUT_DIR}/BraveBrowser*.exe", fingerprint: true
                                 s3Upload(acl: "Private", bucket: "${BRAVE_ARTIFACTS_BUCKET}", includePathPattern: "brave_installer_*.exe",
                                     path: "${JOB_NAME}/${BUILD_NUMBER}/", pathStyleAccessEnabled: true, payloadSigningEnabled: true, workingDir: "${OUT_DIR}"
